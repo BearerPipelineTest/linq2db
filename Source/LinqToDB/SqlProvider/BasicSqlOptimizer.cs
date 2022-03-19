@@ -48,8 +48,7 @@ namespace LinqToDB.SqlProvider
 				static (context, selectQuery) =>
 				{
 					new SelectQueryOptimizer(context.SqlProviderFlags, context.statement, selectQuery, 0).FinalizeAndValidate(
-						context.SqlProviderFlags.IsApplyJoinSupported,
-						context.SqlProviderFlags.IsGroupByExpressionSupported);
+						context.SqlProviderFlags.IsApplyJoinSupported);
 
 					return selectQuery;
 				}
@@ -73,8 +72,7 @@ namespace LinqToDB.SqlProvider
 					static (context, selectQuery) =>
 					{
 						new SelectQueryOptimizer(context.SqlProviderFlags, context.statement, selectQuery, 0).FinalizeAndValidate(
-							context.SqlProviderFlags.IsApplyJoinSupported,
-							context.SqlProviderFlags.IsGroupByExpressionSupported);
+							context.SqlProviderFlags.IsApplyJoinSupported);
 
 						return selectQuery;
 					}
@@ -92,7 +90,7 @@ namespace LinqToDB.SqlProvider
 			}
 
 			statement = CorrectUnionOrderBy(statement);
-			statement = FixSetOperationNulls(statement);
+			statement = FixSetOperationColumnTypes(statement);
 
 			// provider specific query correction
 			statement = FinalizeStatement(statement, evaluationContext);
@@ -136,30 +134,7 @@ namespace LinqToDB.SqlProvider
 				withStack: true);
 		}
 
-		static void CorrelateNullValueTypes(ref ISqlExpression toCorrect, ISqlExpression reference)
-		{
-			if (toCorrect.ElementType == QueryElementType.Column)
-			{
-				var column     = (SqlColumn)toCorrect;
-				var columnExpr = column.Expression;
-				CorrelateNullValueTypes(ref columnExpr, reference);
-				column.Expression = columnExpr;
-			}
-			else if (toCorrect.ElementType == QueryElementType.SqlValue)
-			{
-				var value = (SqlValue)toCorrect;
-				if (value.Value == null)
-				{
-					var suggested = QueryHelper.SuggestDbDataType(reference);
-					if (suggested != null)
-					{
-						toCorrect = new SqlValue(suggested.Value, null);
-					}
-				}
-			}
-		}
-
-		protected virtual SqlStatement FixSetOperationNulls(SqlStatement statement)
+		protected virtual SqlStatement FixSetOperationColumnTypes(SqlStatement statement)
 		{
 			statement.VisitParentFirst(static e =>
 			{
@@ -170,21 +145,73 @@ namespace LinqToDB.SqlProvider
 					{
 						for (int i = 0; i < query.Select.Columns.Count; i++)
 						{
-							var column     = query.Select.Columns[i];
-							var columnExpr = column.Expression;
+							var firstColumn = query.Select.Columns[i];
 
-							foreach (var setOperator in query.SetOperators)
+							var needsTyping =  firstColumn.Expression is SqlValue;
+							if (!needsTyping)
 							{
-								var otherColumn = setOperator.SelectQuery.Select.Columns[i];
-								var otherExpr   = otherColumn.Expression;
-
-								CorrelateNullValueTypes(ref columnExpr, otherExpr);
-								CorrelateNullValueTypes(ref otherExpr, columnExpr);
-
-								otherColumn.Expression = otherExpr;
+								foreach (var setOperator in query.SetOperators)
+								{
+									needsTyping = setOperator.SelectQuery.Select.Columns[i].Expression is SqlValue;
+									if (needsTyping)
+										break;
+								}
 							}
 
-							column.Expression = columnExpr;
+							if (!needsTyping)
+								continue;
+
+							DbDataType suggestedType        = default;
+							DbDataType suggestedByValueType = default;
+							if (firstColumn.Expression is SqlValue value)
+							{
+								suggestedByValueType = value.ValueType;
+							}
+							else
+							{
+								suggestedType = firstColumn.Expression.GetExpressionType();
+							}
+
+							if (suggestedType.DataType == DataType.Undefined)
+							{
+								foreach (var setOperator in query.SetOperators)
+								{
+									if (setOperator.SelectQuery.Select.Columns[i].Expression is SqlValue v)
+									{
+										if (suggestedByValueType.DataType == DataType.Undefined)
+										{
+											suggestedByValueType = v.ValueType;
+										}
+									}
+									else
+									{
+										suggestedType = setOperator.SelectQuery.Select.Columns[i].Expression.GetExpressionType();
+									}
+
+									if (suggestedType.DataType != DataType.Undefined)
+										break;
+								}
+							}
+
+							if (suggestedType.DataType == DataType.Undefined)
+								suggestedType = suggestedByValueType;
+
+							if (suggestedType.DataType != DataType.Undefined)
+							{
+								if (firstColumn.Expression is SqlValue firstVal)
+								{
+									firstColumn.Expression = new SqlValue(suggestedType, firstVal.Value);
+								}
+
+								foreach (var setOperator in query.SetOperators)
+								{
+									var v = setOperator.SelectQuery.Select.Columns[i].Expression as SqlValue;
+									if (v == null)
+										continue;
+
+									setOperator.SelectQuery.Select.Columns[i].Expression = new SqlValue(suggestedType, v.Value);
+								}
+							}
 						}
 					}
 				}
@@ -194,7 +221,6 @@ namespace LinqToDB.SqlProvider
 
 			return statement;
 		}
-
 
 		protected virtual void FixEmptySelect(SqlStatement statement)
 		{
@@ -1173,7 +1199,8 @@ namespace LinqToDB.SqlProvider
 					return predicate;
 			}
 
-			if (predicate.TryEvaluateExpression(context, out var value) && value != null)
+			if (predicate.ElementType != QueryElementType.SearchCondition
+				&& predicate.TryEvaluateExpression(context, out var value) && value != null)
 			{
 				return new SqlPredicate.Expr(new SqlValue(value));
 			}
@@ -1637,6 +1664,33 @@ namespace LinqToDB.SqlProvider
 			return OptimizeElement(mappingSchema, element, context, true);
 		}
 
+		private ISqlExpression? ConvertExpressionToString(ISqlExpression stringExpression, ISqlExpression convertedExpression, ConvertVisitor<RunOptimizationContext> visitor)
+		{
+			var strType = stringExpression.GetExpressionType();
+			if (strType.DataType != DataType.Undefined
+				&& convertedExpression is SqlValue value
+				&& (value.ValueType.SystemType == typeof(char) || value.ValueType.SystemType == typeof(char?))
+				&& value.ValueType.DataType == DataType.Undefined)
+			{
+				value.ValueType = strType;
+				// in-place fix
+				return null;
+			}
+
+			var len = convertedExpression.SystemType == typeof(char) || convertedExpression.SystemType == typeof(char?)
+				? 1
+				: convertedExpression.SystemType == null
+					? 100
+					: SqlDataType.GetMaxDisplaySize(convertedExpression.GetExpressionType().DataType);
+
+			if (len == null || len <= 0)
+				len = 100;
+
+			var dataType = strType.DataType != DataType.Undefined ? strType.DataType : (visitor.Context.MappingSchema?.GetDataType(typeof(string)) ?? SqlDataType.GetDataType(typeof(string))).Type.DataType;
+
+			return ConvertExpressionImpl(new SqlFunction(typeof(string), "Convert", new SqlDataType(dataType, len), convertedExpression), visitor);
+		}
+
 		public virtual ISqlExpression ConvertExpressionImpl(ISqlExpression expression, ConvertVisitor<RunOptimizationContext> visitor)
 		{
 			switch (expression.ElementType)
@@ -1652,29 +1706,26 @@ namespace LinqToDB.SqlProvider
 						{
 							if (be.Expr1.SystemType == typeof(string) && be.Expr2.SystemType != typeof(string))
 							{
-								var len = be.Expr2.SystemType == null ? 100 : SqlDataType.GetMaxDisplaySize(SqlDataType.GetDataType(be.Expr2.SystemType).Type.DataType);
-
-								if (len == null || len <= 0)
-									len = 100;
+								var expr2 = ConvertExpressionToString(be.Expr1, be.Expr2, visitor);
+								if (expr2 == null)
+									break;
 
 								return new SqlBinaryExpression(
 									be.SystemType,
 									be.Expr1,
 									be.Operation,
-									ConvertExpressionImpl(new SqlFunction(typeof(string), "Convert", new SqlDataType(DataType.VarChar, len), be.Expr2), visitor),
+									expr2,
 									be.Precedence);
 							}
-
-							if (be.Expr1.SystemType != typeof(string) && be.Expr2.SystemType == typeof(string))
+							else if (be.Expr1.SystemType != typeof(string) && be.Expr2.SystemType == typeof(string))
 							{
-								var len = be.Expr1.SystemType == null ? 100 : SqlDataType.GetMaxDisplaySize(SqlDataType.GetDataType(be.Expr1.SystemType).Type.DataType);
-
-								if (len == null || len <= 0)
-									len = 100;
+								var expr1 = ConvertExpressionToString(be.Expr2, be.Expr1, visitor);
+								if (expr1 == null)
+									break;
 
 								return new SqlBinaryExpression(
 									be.SystemType,
-									ConvertExpressionImpl(new SqlFunction(typeof(string), "Convert", new SqlDataType(DataType.VarChar, len), be.Expr1), visitor),
+									expr1,
 									be.Operation,
 									be.Expr2,
 									be.Precedence);
@@ -1864,6 +1915,7 @@ namespace LinqToDB.SqlProvider
 					});
 
 			}
+
 			return newElement;
 		}
 
